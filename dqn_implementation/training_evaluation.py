@@ -14,8 +14,8 @@ class Predictor:
     """ Model wrapper enabling training and prediction """
     def __init__(self, replay_memory_size, stacked_frames, env, action_count,
                  replay_start_size, action_repeat, update_frequency, noop_max,
-                 scaling_factor, network_update_frequency, end_eps_frame,
-                 eps_beg, eps_end, models_directory, device):
+                 scaling_factor, network_update_frequency,
+                 models_directory, device):
 
         # These three together form the memory consisting of experiences
         # e = (s,a,r,s')
@@ -41,21 +41,16 @@ class Predictor:
         self.action_count = action_count
         self.device = device
 
-        self.end_eps_frame = end_eps_frame
-        self.eps_beg = eps_beg
-        self.eps_end = eps_end
-        self.eps_step = (eps_beg - eps_end) / end_eps_frame
-
-        self.dqn_current = DQN(action_count).to(device).eval()
-        self.dqn_new = DQN(action_count).to(device).train()
+        self.dqn_current = DQN(action_count).to(device)
+        self.dqn_new = DQN(action_count).to(device)
         self.dqn_new.load_state_dict(self.dqn_current.state_dict())
 
         self.losses = None
         self.reward_sums = None
 
     def set_model(self, model):
-        self.dqn_current = model.to(self.device).eval()
-        self.dqn_new = DQN(self.action_count).to(self.device).train()
+        self.dqn_current = model.to(self.device)
+        self.dqn_new = DQN(self.action_count).to(self.device)
         self.dqn_new.load_state_dict(self.dqn_current.state_dict())
 
     def set_model_from_file(self, filepath):
@@ -64,7 +59,12 @@ class Predictor:
         self.set_model(model)
 
     def train(self, epochs, optimizer, batch_size, stages, stage,
-              cp_name="dqn_checkpoint", save_loss_every=100):
+              end_eps_frame, eps_beg, eps_end, cp_name="dqn_checkpoint"):
+
+        eps_step = (eps_beg - eps_end) / end_eps_frame
+
+        self.dqn_current.eval()
+        self.dqn_new.train()
 
         if (self.losses is None) or (self.reward_sums is None):
             self.losses = np.zeros((stages, epochs))
@@ -85,8 +85,8 @@ class Predictor:
 
             while(True):
                 # Interact with environment
-                epsilon = max(self.eps_beg - (self.total_frames *
-                                              self.eps_step), self.eps_end)
+                epsilon = max(eps_beg - (self.total_frames *
+                                         eps_step), eps_end)
 
                 action = self.__choose_action(episode_frames, epsilon,
                                               last_frames, previous_action)
@@ -115,6 +115,7 @@ class Predictor:
                 frame = np.where(last_frame > observation, last_frame, observation)
                 frame = rgb2grayscale(frame)
                 frame = resize(frame, (84, 84))
+                frame = frame / 255.0
 
                 # Stacking last four frames and assigning last frame (observation)
                 last_frames = np.concatenate((last_frames[1:], frame[None, :]))
@@ -128,6 +129,7 @@ class Predictor:
                         episodes_end_indices = np.array(self.episodes_end).nonzero()[0]
                         batch_indices = np.random.choice(range(experience_count-1), batch_size, False)
 
+                        # Sample states, actions, rewards and new states
                         s = torch.from_numpy(self.states[batch_indices]).float().to(self.device)
                         a = torch.from_numpy(self.actions[batch_indices]).float().to(self.device)
                         r = torch.from_numpy(self.rewards[batch_indices]).float().to(self.device)
@@ -137,11 +139,10 @@ class Predictor:
                         episodes_end_mask = torch.from_numpy(
                             (batch_indices[:, None] == episodes_end_indices[None, :]).any(axis=1)).to(self.device)
 
-                        # Select only outputs corresponding to selected actions
-                        output_current = self.dqn_current(sn)[
-                            range(batch_size),
-                            a.to(torch.long)
-                        ]
+                        # Select only outputs with maximal reward
+                        output_current = torch.max(self.dqn_current(sn), 1).values
+
+                        # Select actions that were originally selected
                         output_new = self.dqn_new(s)[range(batch_size),
                                                      a.to(torch.long)]
 
@@ -151,14 +152,17 @@ class Predictor:
                                                      torch.zeros(
                                                          batch_size,
                                                          device=self.device),
-                                                     output_current)
+                                                     output_current).detach()
 
                         target = r + (self.scaling_factor * output_current)
 
                         optimizer.zero_grad()
 
-                        loss = F.mse_loss(output_new, target)
+                        loss = F.smooth_l1_loss(output_new, target)
                         loss.backward()
+
+                        for param in self.dqn_new.parameters():
+                                param.grad.data.clamp_(-1, 1)
 
                         optimizer.step()
 
@@ -168,8 +172,7 @@ class Predictor:
 
                     if self.total_frames % self.network_update_frequency == 0:
                         self.dqn_current.load_state_dict(
-                            self.dqn_new.state_dict()
-                        )
+                            self.dqn_new.state_dict())
 
                 self.reward_sums[stage, epoch] += reward
 
@@ -192,7 +195,7 @@ class Predictor:
 
         self.env.close()
 
-    def __plot(self, data, stages, epochs):
+    def __plot(self, data, stages, epochs, title):
         if stages is not None:
             data = data[stages]
             if epochs is not None:
@@ -203,28 +206,34 @@ class Predictor:
         data = np.reshape(data, -1)
         fig, ax = plt.subplots()
         ax.plot(range(1, len(data)+1), data)
+        if title is not None:
+            ax.set_title(title)
+
         ax.grid()
 
-    def plot_losses(self, stages=None, epochs=None):
+    def plot_losses(self, stages=None, epochs=None, title=None):
         """ Can be used after full training """
         if self.losses is None:
             print("Nothing to plot")
             return
 
-        self.__plot(self.losses, stages, epochs)
+        self.__plot(self.losses, stages, epochs, title)
 
-    def plot_rewards(self, stages=None, epochs=None):
+    def plot_rewards(self, stages=None, epochs=None, title=None):
         """ Can be used after full training """
         if self.reward_sums is None:
             print("Nothing to plot")
             return
 
-        self.__plot(self.reward_sums, stages, epochs)
+        self.__plot(self.reward_sums, stages, epochs, title)
 
     def visualize(self, epochs, epsilon=0.05, render=False, frame_delay=0.01,
                  batch_size=32, time_limit=None):
 
-        rewards = 0
+        self.dqn_current.eval()
+        self.dqn_new.eval()
+
+        rewards = []
         t0 = time.time()
 
         epoch = 0
@@ -241,6 +250,7 @@ class Predictor:
 
             previous_action = None
 
+            rewards.append(0)
             noops = 0
             episode_frames = 0
 
@@ -263,6 +273,7 @@ class Predictor:
                 frame = np.where(last_frame > observation, last_frame, observation)
                 frame = rgb2grayscale(frame)
                 frame = resize(frame, (84, 84))
+                frame = frame / 255.0
 
                 # Stacking last four frames and assigning last frame (observation)
                 last_frames = np.concatenate((last_frames[1:], frame[None, :]))
@@ -274,7 +285,7 @@ class Predictor:
                     noops = 0
 
                 episode_frames += 1
-                rewards += reward
+                rewards[-1] += reward
 
                 if done or (noops >= 30):
                     noops = 0
@@ -295,6 +306,8 @@ class Predictor:
             else:
                 inp_torch = torch.from_numpy(last_frames[None, :]).float().to(self.device)
                 action_torch = self.dqn_current(inp_torch).argmax(axis=1)[0]
+                # if episode_frames > 50:
+                #     print(self.dqn_current(inp_torch))
                 action = action_torch.cpu().detach().numpy()
         else:
             action = previous_action
